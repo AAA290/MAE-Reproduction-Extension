@@ -1,4 +1,5 @@
-# 直接来自源代码 https://github.com/facebookresearch/mae.git
+# 来自源代码 https://github.com/facebookresearch/mae.git
+# 修改使其适用于my_mae
 # --------------------------------------------------------
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
@@ -47,7 +48,8 @@ def train_one_epoch(model: torch.nn.Module,
         samples = samples.to(device, non_blocking=True)
 
         with torch.cuda.amp.autocast():
-            loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
+            # 修改模型输入和输出
+            loss, mean, var, pred, mask = model(samples)
 
         loss_value = loss.item()
 

@@ -1,5 +1,5 @@
 # 主要代码来源https://github.com/facebookresearch/mae.git
-# 修改部分由AI生成，只增加了Wrapper等让自定义模型与源代码适配
+# 修改部分适应自定义模型
 # -------------------------------------------------------------------#
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
@@ -38,53 +38,38 @@ from engine_pretrain import train_one_epoch
 from my_vit import MyVit
 from my_mae import MyMaskedAutoencoder
 
-# ----- 接口适配器 (Adapter Pattern) -----
-class MyMAEAdapter(nn.Module):
-    """
-    这是一个适配器类，用于弥合官方引擎(main_pretrain.py)与自定义模型之间的接口差异。
-    """
-    def __init__(self, norm_pix_loss=True):
-        super().__init__()
-        # 实例化ViT Encoder，使用Base规格
-        encoder = MyVit(img_size=224, patch_size=16, embed_dim=768, depth=12, num_heads=12)
-
-        self.model = MyMaskedAutoencoder(
-            encoder=encoder,
-            decoder_dim=512,
-            decoder_depth=8,
-            decoder_num_heads=16
-        )
-
-    def forward(self, imgs, mask_ratio=0.75):
-        self.model.mask_ratio = mask_ratio
-
-        loss, mean, var, pred, mask = self.model(imgs)
-
-        return loss, pred, mask
-# ---------------------------------------------
-
-
 def get_args_parser():
-    parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
+    # 修改参数
+    parser = argparse.ArgumentParser('MyMae pre-training', add_help=False)
+
+    parser.add_argument('--img_size', default=224, type=int,
+                        help='images input size')
+    parser.add_argument('--patch_size', default=16, type=int,
+                        help='patch size of the ViT model')
     parser.add_argument('--batch_size', default=64, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
+    parser.add_argument('--in_chans',default=3,type=int)
+    parser.add_argument('--encoder_dim',default=768,type=int)
+    parser.add_argument('--encoder_depth',default=16,type=int)
+    parser.add_argument('--encoder_num_heads',default=16,type=int)
+    parser.add_argument('--encoder_mlp_ratio',default=4.,type=float)
+
+    parser.add_argument('--mask_type', default='random', type=str,
+                        help='Type of masking method to train')
+    parser.add_argument('--mask_ratio', default=0.75, type=float,
+                        help='Masking ratio (percentage of removed patches).')
+    parser.add_argument('--norm_pix_loss', action='store_true',
+                        help='Use (per-patch) normalized pixels as targets for computing loss')
+    parser.set_defaults(norm_pix_loss=False)
+
+    parser.add_argument('--decoder_dim',default=512,type=int)
+    parser.add_argument('--decoder_depth',default=6,type=int)
+    parser.add_argument('--decoder_num_heads',default=16,type=int)
+    parser.add_argument('--decoder_mlp_ratio',default=4.,type=float)
+
     parser.add_argument('--epochs', default=400, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
-
-    # Model parameters (这里默认保持不变，实际上适配器内部已经写死了模型)
-    parser.add_argument('--model', default='my_mae_vit_base_patch16', type=str, metavar='MODEL',
-                        help='Name of model to train')
-
-    parser.add_argument('--input_size', default=224, type=int,
-                        help='images input size')
-
-    parser.add_argument('--mask_ratio', default=0.75, type=float,
-                        help='Masking ratio (percentage of removed patches).')
-
-    parser.add_argument('--norm_pix_loss', action='store_true',
-                        help='Use (per-patch) normalized pixels as targets for computing loss')
-    parser.set_defaults(norm_pix_loss=True) # 默认开启标准化Trick
 
     # Optimizer parameters
     parser.add_argument('--weight_decay', type=float, default=0.05,
@@ -152,7 +137,7 @@ def main(args):
 
     # simple augmentation
     transform_train = transforms.Compose([
-        transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
+        transforms.RandomResizedCrop(args.img_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
@@ -182,11 +167,18 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=True,
     )
-
-    # ---------------------------------------------------------
-    # 直接使用自定义的 Adapter 实例化模型，取代官方基于字符串的字典查找
-    # ---------------------------------------------------------
-    model = MyMAEAdapter(norm_pix_loss=args.norm_pix_loss)
+    # 修改模型
+    encoder = MyVit(img_size=args.img_size, patch_size=args.patch_size, embed_dim=args.encoder_dim, depth=args.encoder_depth, num_heads=args.encoder_num_heads)
+    model=MyMaskedAutoencoder(
+        encoder=encoder,
+        mask_type=args.mask_type,
+        mask_ratio=args.mask_ratio,
+        decoder_dim=args.decoder_dim,
+        decoder_depth=args.decoder_depth,
+        decoder_num_heads=args.decoder_num_heads,
+        decoder_mlp_ratio=args.decoder_mlp_ratio,
+        norm_pix_loss=args.norm_pix_loss
+    )
 
     model.to(device)
 
@@ -222,7 +214,6 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        # 官方引擎调用训练，此时会调用 MyMAEAdapter
         train_stats = train_one_epoch(
             model, data_loader_train,
             optimizer, device, epoch, loss_scaler,

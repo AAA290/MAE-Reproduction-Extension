@@ -8,13 +8,13 @@ class MyBlock(nn.Module):
     def __init__(self,embed_dim, num_heads, mlp_ratio):
         super().__init__()
         # pre-norm 把输入的数据拉回正态分布，防止梯度爆炸或消失
-        self.norm1=nn.LayerNorm(embed_dim)
+        self.norm1=nn.LayerNorm(embed_dim, eps=1e-6)
 
         # MultiheadAttention 全局信息交流
-        self.attn=nn.MultiheadAttention(embed_dim,num_heads,batch_first=True)
+        self.attn=nn.MultiheadAttention(embed_dim,num_heads,batch_first=True,bias=True)
 
         # norm2 为进入 MLP 做准备，再次稳定数据
-        self.norm2=nn.LayerNorm(embed_dim)
+        self.norm2=nn.LayerNorm(embed_dim, eps=1e-6)
 
         # MLP 内部信息交流，Token 内部的特征升维与提炼
         hidden_dim=int(embed_dim*mlp_ratio)
@@ -28,7 +28,7 @@ class MyBlock(nn.Module):
         # 归一化
         x_norm=self.norm1(x)
         # 计算Attention
-        attn_out,_=self.attn(x_norm,x_norm,x_norm)
+        attn_out,attn_w=self.attn(x_norm,x_norm,x_norm)
         # 残差连接
         x=x+attn_out
         # 归一化
@@ -74,7 +74,7 @@ class MyVit(nn.Module):
             MyBlock(embed_dim, num_heads, mlp_ratio)
              for _ in range(depth)])
         # 最终的归一化层
-        self.norm=nn.LayerNorm(embed_dim)
+        self.norm=nn.LayerNorm(embed_dim, eps=1e-6)
         # 如果是全局表征任务，比如分类任务，则返回线性层，其中num_classes>0是输出的维度
         self.head=nn.Linear(embed_dim,num_classes) if num_classes>0 else None
 

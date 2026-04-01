@@ -4,10 +4,12 @@ import torch.nn as nn
 from my_vit import MyBlock
 # 直接导入mae源代码写好的util来生成固定的2D正余弦位置编码
 from util.pos_embed import get_2d_sincos_pos_embed
+from my_util.edge_ops import SobelPatchScorer
 
 class MyMaskedAutoencoder(nn.Module):
-    def __init__(self, encoder, mask_type='random',mask_ratio=0.75, decoder_dim=512, decoder_depth=8, decoder_num_heads=16, decoder_mlp_ratio=4.):
+    def __init__(self, encoder, mask_type='random',mask_ratio=0.75, decoder_dim=512, decoder_depth=8, decoder_num_heads=16, decoder_mlp_ratio=4.,norm_pix_loss=False):
         super().__init__()
+        self.norm_pix_loss=norm_pix_loss
         # Wrapper模式，encoder直接使用MyVit，用于下游任务时可以提取出encoder直接使用
         self.encoder=encoder
         num_patches=encoder.num_patches
@@ -30,6 +32,8 @@ class MyMaskedAutoencoder(nn.Module):
         self.mask_ratio=mask_ratio
         # mask掉的patch输入decoder都会表示为这个统一的mask token，维度[1,1,decoder_dim]
         self.mask_token=nn.Parameter(torch.zeros(1,1,decoder_dim))
+        # edge-guided masking需要用到的边缘打分器
+        self.edge_scorer = SobelPatchScorer(patch_size=patch_size)
 
         # 从encoder高维降到decoder低维的线性层
         self.enc_to_dec=nn.Linear(encoder_dim,decoder_dim) if encoder_dim != decoder_dim else nn.Identity()
@@ -38,7 +42,7 @@ class MyMaskedAutoencoder(nn.Module):
         self.decoder=nn.ModuleList([
             MyBlock(decoder_dim, decoder_num_heads, decoder_mlp_ratio)
             for _ in range(decoder_depth)])
-        self.decoder_norm=nn.LayerNorm(decoder_dim)
+        self.decoder_norm=nn.LayerNorm(decoder_dim, eps=1e-6)
         # decoder的位置编码，维度[1,num_patches+1,decoder_embedDim],同样是固定编码，不可学习所以不需要计算梯度
         self.decoder_pos_embed = nn.Parameter(torch.from_numpy(dec_pos_embed_np).float().unsqueeze(0), requires_grad=False)
         # 将decoder输出的latent represenation转化为原始像素的头
@@ -50,13 +54,15 @@ class MyMaskedAutoencoder(nn.Module):
         # 全局初始化，复用在MyVit写过的初始化函数
         self.apply(self.encoder._init_weights)
 
-    def masking(self, x, mask_type='random', mask_ratio=0.75):
+    def masking(self, imgs, x, mask_type='random', mask_ratio=0.75):
         # 根据不同的masking策略调用不同的函数
         strategies = {
             'random': self.random_masking,
             'attn': self.attn_guided_masking,
             'edge': self.edge_guided_masking
         }
+        if mask_type=='edge':
+            return strategies[mask_type](imgs, x, mask_ratio)
         return strategies[mask_type](x, mask_ratio)
 
     def random_masking(self, x, mask_ratio):
@@ -87,22 +93,57 @@ class MyMaskedAutoencoder(nn.Module):
 
         return x_keep,mask,ids_restore
 
+    def edge_guided_masking(self, imgs, x, mask_ratio):
+        # 扩展1：边缘引导掩码
+        batch_size, num_patches, encoder_dim = x.shape
+        num_keep = int((1 - mask_ratio) * num_patches)
+
+        # 1 计算边缘得分 [B, L]
+        with torch.no_grad():
+            scores = self.edge_scorer(imgs)
+
+            # 将“边缘得分”与“随机噪声”进行加权混合，增强泛化能力，并且随机保留一些重要的边缘块给模型学习
+            # 边缘得分归一化
+            scores_min = scores.min(dim=-1, keepdim=True)[0]
+            scores_max = scores.max(dim=-1, keepdim=True)[0]
+            norm_scores = (scores - scores_min) / (scores_max - scores_min + 1e-6)
+
+            alpha = 0.5  # 这是一个可以消融的超参数，控制边缘引导的强度
+            combined_scores = (1 - alpha) * torch.rand_like(scores) + alpha * norm_scores
+
+        # 2 根据综合得分进行排序
+        ids_shuffle = torch.argsort(combined_scores, dim=1)  # 升序排列
+        ids_keep = ids_shuffle[:, :num_keep]
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        # 3 提取保留下来的特征块
+        ids_keep_expanded = ids_keep.unsqueeze(-1).repeat(1, 1, encoder_dim)
+        x_keep = torch.gather(x, dim=1, index=ids_keep_expanded)
+
+        mask = torch.ones([batch_size, num_patches], device=x.device)
+        mask[:, :num_keep] = 0
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        return x_keep, mask, ids_restore
+
     def attn_guided_masking(self, x, mask_ratio):
         # 扩展1：注意力引导掩码
+        # 1 提取，warmup得到初步的自注意力矩阵
+
+        # 2 计算，对每个patch的注意力进行计算
+
+        # 3 排序，根据计算结果排序，决定保留部分
+
         pass
 
-    def edge_guided_masking(self, x, mask_ratio):
-        # 扩展2：边缘引导掩码
-        pass
-
-    def forward_loss(self, imgs, pred, mask,norm_pix_loss=True):
+    def forward_loss(self, imgs, pred, mask):
         """
         计算loss的函数，直接修改使用原论文代码
         norm_pix_loss=True时使用原论文提出的 提升性能的Trick——目标像素标准化
         """
         # 只切块
         target = self.encoder.patch_embed[0](imgs)
-        if norm_pix_loss:
+        if self.norm_pix_loss:
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var + 1.e-6)**.5
@@ -126,7 +167,7 @@ class MyMaskedAutoencoder(nn.Module):
         x=x+self.encoder.pos_embed[:,1:,:]
 
         # 3 掩码,返回的x是保留后的块的tokens+pos_embed以及ids_restore(用于后续还原)
-        x,mask,ids_restore=self.masking(x,mask_type=self.mask_type,mask_ratio=self.mask_ratio)
+        x,mask,ids_restore=self.masking(imgs,x,mask_type=self.mask_type,mask_ratio=self.mask_ratio)
         L_keep=x.shape[1]
         L_mask=num_patches-L_keep
 
@@ -173,7 +214,7 @@ class MyMaskedAutoencoder(nn.Module):
         pred=self.to_pixels(decoder_out[:,1:,:])
 
         # 11 计算loss
-        loss, mean, var = self.forward_loss(imgs, pred, mask, norm_pix_loss=True)
+        loss, mean, var = self.forward_loss(imgs, pred, mask)
 
         # # 12 反标准化,把模型预测的标准化像素，乘回方差，加回均值 #放到外部实现，训练过程中不需要每次都进行这一步
         # pred_unnorm = pred * (var + 1.e-6)**.5 + mean
