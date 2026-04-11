@@ -63,6 +63,8 @@ class MyVit(nn.Module):
             nn.Linear(patch_size**2*in_chans,embed_dim)
         )
 
+        self.patch_embed.num_patches = self.num_patches
+
         self.pool=pool
         # cls token 维度[1,1,embedDim] 占位初始化，无所谓全0或者随机
         self.cls_token=nn.Parameter(torch.zeros(1,1,embed_dim))

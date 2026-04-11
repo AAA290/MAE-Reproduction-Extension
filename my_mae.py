@@ -108,7 +108,7 @@ class MyMaskedAutoencoder(nn.Module):
             scores_max = scores.max(dim=-1, keepdim=True)[0]
             norm_scores = (scores - scores_min) / (scores_max - scores_min + 1e-6)
 
-            alpha = 0.5  # 这是一个可以消融的超参数，控制边缘引导的强度
+            alpha = 0.2  # 这是一个可以消融的超参数，控制边缘引导的强度，试过alpha=0.5，任务难度太大，收敛速度慢
             combined_scores = (1 - alpha) * torch.rand_like(scores) + alpha * norm_scores
 
         # 2 根据综合得分进行排序
@@ -127,14 +127,54 @@ class MyMaskedAutoencoder(nn.Module):
         return x_keep, mask, ids_restore
 
     def attn_guided_masking(self, x, mask_ratio):
-        # 扩展1：注意力引导掩码
-        # 1 提取，warmup得到初步的自注意力矩阵
+        # 扩展2：注意力引导掩码
+        B, L, D = x.shape
+        num_keep = int((1 - mask_ratio) * L)
 
-        # 2 计算，对每个patch的注意力进行计算
+        # 1 提取自注意力矩阵 (Warmup)
+        # 加回 cls_token
+        cls_token = self.encoder.cls_token.expand(B, -1, -1)
+        cls_token = cls_token + self.encoder.pos_embed[:, :1, :]
+        x_full = torch.cat((cls_token, x), dim=1)  # [B, L+1, D]
 
-        # 3 排序，根据计算结果排序，决定保留部分
+        with torch.no_grad():
+            # 取第一层 Block 的注意力输出作为重要性参考,可以快速获取 Patch 之间的关联性
+            blk = self.encoder.blocks[0]
 
-        pass
+            # 执行第一层 Block 的一部分逻辑以获取注意力权重
+            x_norm = blk.norm1(x_full)
+            # attn_weights 维度为 [B, L+1, L+1]
+            _, attn_weights = blk.attn(x_norm, x_norm, x_norm)
+
+        # 2 计算每个 patch 的重要性得分
+        # 取 [CLS] token (索引0) 对所有 patch (索引1到L+1) 的注意力权重
+        scores = attn_weights[:, 0, 1:]  # 维度 [B, L]
+
+        # 归一化得分到 [0, 1] 之间
+        scores_min = scores.min(dim=-1, keepdim=True)[0]
+        scores_max = scores.max(dim=-1, keepdim=True)[0]
+        norm_scores = (scores - scores_min) / (scores_max - scores_min + 1e-6)
+
+        # 3 排序与掩码逻辑 (与 edge 策略对齐)
+        # 引入 alpha 混合随机性：既考虑注意力重要性，也保留 MAE 的随机探索特质
+        alpha = 0.3
+        combined_scores = (1 - alpha) * torch.rand_like(scores) + alpha * norm_scores
+
+        # 升序排序
+        ids_shuffle = torch.argsort(combined_scores, dim=1)
+        ids_keep = ids_shuffle[:, :num_keep]
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        # 4 提取保留下来的特征块
+        ids_keep_expanded = ids_keep.unsqueeze(-1).repeat(1, 1, D)
+        x_keep = torch.gather(x, dim=1, index=ids_keep_expanded)
+
+        # 生成掩码标记
+        mask = torch.ones([B, L], device=x.device)
+        mask[:, :num_keep] = 0
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        return x_keep, mask, ids_restore
 
     def forward_loss(self, imgs, pred, mask):
         """

@@ -26,14 +26,16 @@ def train_one_epoch(model: torch.nn.Module,
                     device: torch.device, epoch: int, loss_scaler,
                     log_writer=None,
                     args=None):
+    # 开启训练模式
     model.train(True)
+    # 初始化日志记录器
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 20
 
     accum_iter = args.accum_iter
-
+    # 初始清零
     optimizer.zero_grad()
 
     if log_writer is not None:
@@ -46,31 +48,33 @@ def train_one_epoch(model: torch.nn.Module,
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
         samples = samples.to(device, non_blocking=True)
-
+        # AMP
         with torch.cuda.amp.autocast():
             # 修改模型输入和输出
             loss, mean, var, pred, mask = model(samples)
 
         loss_value = loss.item()
-
+        # 异常熔断机制
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
             sys.exit(1)
-
+        # 损失等比例缩小
         loss /= accum_iter
         loss_scaler(loss, optimizer, parameters=model.parameters(),
                     update_grad=(data_iter_step + 1) % accum_iter == 0)
+        # 攒够了步数才清空梯度
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()
-
+        # 等待所有 GPU 算完
         torch.cuda.synchronize()
 
         metric_logger.update(loss=loss_value)
 
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
-
+        # 跨显卡收集真实 Loss
         loss_value_reduce = misc.all_reduce_mean(loss_value)
+        # 写入 TensorBoard
         if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
             """ We use epoch_1000x as the x-axis in tensorboard.
             This calibrates different curves when batch size changes.
@@ -81,6 +85,7 @@ def train_one_epoch(model: torch.nn.Module,
 
 
     # gather the stats from all processes
+    # 循环结束，做一次全局状态同步
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}

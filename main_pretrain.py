@@ -39,21 +39,25 @@ from my_vit import MyVit
 from my_mae import MyMaskedAutoencoder
 
 def get_args_parser():
-    # 修改参数
+    # 命令行参数解析
     parser = argparse.ArgumentParser('MyMae pre-training', add_help=False)
 
+    # 模型结构参数
     parser.add_argument('--img_size', default=224, type=int,
                         help='images input size')
     parser.add_argument('--patch_size', default=16, type=int,
                         help='patch size of the ViT model')
-    parser.add_argument('--batch_size', default=64, type=int,
-                        help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--in_chans',default=3,type=int)
     parser.add_argument('--encoder_dim',default=768,type=int)
     parser.add_argument('--encoder_depth',default=16,type=int)
     parser.add_argument('--encoder_num_heads',default=16,type=int)
     parser.add_argument('--encoder_mlp_ratio',default=4.,type=float)
+    parser.add_argument('--decoder_dim',default=512,type=int)
+    parser.add_argument('--decoder_depth',default=6,type=int)
+    parser.add_argument('--decoder_num_heads',default=16,type=int)
+    parser.add_argument('--decoder_mlp_ratio',default=4.,type=float)
 
+    # 核心算法参数
     parser.add_argument('--mask_type', default='random', type=str,
                         help='Type of masking method to train')
     parser.add_argument('--mask_ratio', default=0.75, type=float,
@@ -62,16 +66,13 @@ def get_args_parser():
                         help='Use (per-patch) normalized pixels as targets for computing loss')
     parser.set_defaults(norm_pix_loss=False)
 
-    parser.add_argument('--decoder_dim',default=512,type=int)
-    parser.add_argument('--decoder_depth',default=6,type=int)
-    parser.add_argument('--decoder_num_heads',default=16,type=int)
-    parser.add_argument('--decoder_mlp_ratio',default=4.,type=float)
-
+    # 训练与优化器参数
+    parser.add_argument('--batch_size', default=64, type=int,
+                        help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--epochs', default=400, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
-    # Optimizer parameters
     parser.add_argument('--weight_decay', type=float, default=0.05,
                         help='weight decay (default: 0.05)')
 
@@ -85,7 +86,7 @@ def get_args_parser():
     parser.add_argument('--warmup_epochs', type=int, default=40, metavar='N',
                         help='epochs to warmup LR')
 
-    # Dataset parameters
+    # 数据与路径控制参数
     parser.add_argument('--data_path', default='/datasets01/imagenet_full_size/061417/', type=str,
                         help='dataset path')
 
@@ -107,7 +108,7 @@ def get_args_parser():
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
     parser.set_defaults(pin_mem=True)
 
-    # distributed training parameters
+    # 分布式训练参数
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
     parser.add_argument('--local_rank', default=-1, type=int)
@@ -119,7 +120,7 @@ def get_args_parser():
 
 
 def main(args):
-    misc.init_distributed_mode(args)
+    misc.init_distributed_mode(args) # 唤醒分布式环境
 
     print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
     print("{}".format(args).replace(', ', ',\n'))
@@ -136,6 +137,7 @@ def main(args):
         cudnn.benchmark = True
 
     # simple augmentation
+    # 数据增强pipeline
     transform_train = transforms.Compose([
         transforms.RandomResizedCrop(args.img_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
         transforms.RandomHorizontalFlip(),
@@ -144,7 +146,8 @@ def main(args):
     dataset_train = datasets.ImageFolder(args.data_path, transform=transform_train)
     print(dataset_train)
 
-    if True:  # args.distributed:
+    # 分布式采样器
+    if args.distributed:
         num_tasks = misc.get_world_size()
         global_rank = misc.get_rank()
         sampler_train = torch.utils.data.DistributedSampler(
@@ -160,6 +163,7 @@ def main(args):
     else:
         log_writer = None
 
+    # 数据加载引擎
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
         batch_size=args.batch_size,
@@ -167,7 +171,8 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=True,
     )
-    # 修改模型
+
+    # 自定义模型
     encoder = MyVit(img_size=args.img_size, patch_size=args.patch_size, embed_dim=args.encoder_dim, depth=args.encoder_depth, num_heads=args.encoder_num_heads)
     model=MyMaskedAutoencoder(
         encoder=encoder,
@@ -185,17 +190,17 @@ def main(args):
     model_without_ddp = model
     print("Model = %s" % str(model_without_ddp))
 
+    # 线性学习率缩放
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
-
     if args.lr is None:  # only base_lr is specified
         args.lr = args.blr * eff_batch_size / 256
-
     print("base lr: %.2e" % (args.lr * 256 / eff_batch_size))
     print("actual lr: %.2e" % args.lr)
 
     print("accumulate grad iterations: %d" % args.accum_iter)
     print("effective batch size: %d" % eff_batch_size)
 
+    # DDP包装
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
@@ -204,12 +209,40 @@ def main(args):
     param_groups = optim_factory.param_groups_weight_decay(model_without_ddp, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     print(optimizer)
+    # AMP的缩放器
     loss_scaler = NativeScaler()
 
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
+    # print(f"Start training for {args.epochs} epochs")
+    # start_time = time.time()
+    # for epoch in range(args.start_epoch, args.epochs):
+    #     if args.distributed:
+    #         data_loader_train.sampler.set_epoch(epoch)
+    #
+    #     train_stats = train_one_epoch(
+    #         model, data_loader_train,
+    #         optimizer, device, epoch, loss_scaler,
+    #         log_writer=log_writer,
+    #         args=args
+    #     )
+    #     if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
+    #         misc.save_model(
+    #             args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+    #             loss_scaler=loss_scaler, epoch=epoch)
+    #
+    #     log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+    #                  'epoch': epoch,}
+
+    # 修改模型保存逻辑，改为只保存loss最低的best以及最新的三个模型
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
+
+    # Checkpoint管理队列和最佳Loss记录
+    recent_ckpts = []
+    max_keep = 3
+    best_loss = float('inf')
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
@@ -220,10 +253,36 @@ def main(args):
             log_writer=log_writer,
             args=args
         )
-        if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
-            misc.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch)
+
+        # 获取当前 epoch 的平均 loss
+        current_loss = train_stats['loss']
+
+        if args.output_dir and misc.is_main_process():
+            # 保存 Best Model (根据 Train Loss)
+            if current_loss < best_loss:
+                best_loss = current_loss
+                # 将 epoch 命名为 'best'，misc.save_model 会生成 checkpoint-best.pth
+                misc.save_model(
+                    args=args, model=model, model_without_ddp=model_without_ddp,
+                    optimizer=optimizer, loss_scaler=loss_scaler, epoch="best")
+                print(f"New best model saved with loss: {best_loss:.4f}")
+
+            # 滚动保存最新的模型（每 10 个 epoch 存一次，防断点）
+            if epoch % 10 == 0 or epoch + 1 == args.epochs:
+                misc.save_model(
+                    args=args, model=model, model_without_ddp=model_without_ddp,
+                    optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
+
+                # 记录刚保存的路径
+                ckpt_path = os.path.join(args.output_dir, f'checkpoint-{epoch}.pth')
+                recent_ckpts.append(ckpt_path)
+
+                # 清理老旧的 Checkpoint，保持队列长度不超过 max_keep
+                if len(recent_ckpts) > max_keep:
+                    oldest_ckpt = recent_ckpts.pop(0) # 弹出最老的那个
+                    if os.path.exists(oldest_ckpt):
+                        os.remove(oldest_ckpt)
+                        print(f"Removed old checkpoint to save disk space: {oldest_ckpt}")
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      'epoch': epoch,}
