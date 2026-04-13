@@ -112,7 +112,7 @@ Motivated by the observation that edges and object boundaries carry disproportio
 3. Mix edge scores with uniform random noise via convex combination:
 
 $$
-\text{score} = (1-\alpha) \cdot \text{random} + \alpha \cdot \text{edge\_score}
+\text{score} = (1-\alpha) \cdot \text{random} + \alpha \cdot score_{\text{edge}}
 $$
 
 4. Sort ascending → keep lowest-scoring patches (background-biased visible set) → mask high-edge patches
@@ -129,7 +129,7 @@ Leverages the model's own attention to identify semantically salient regions:
 4. Min-Max normalize; mix with random noise:
 
 $$
-\text{score} = (1-\alpha) \cdot \text{random} + \alpha \cdot \text{attn\_score}
+\text{score} = (1-\alpha) \cdot \text{random} + \alpha \cdot score_{\text{attn}}
 $$
 
 5. Sort ascending → keep low-attention patches → mask high-attention patches
@@ -505,7 +505,7 @@ Patch Token [B, 196, 768]
 3. 与均匀随机噪声进行凸组合：
 
 $$
-\text{score} = (1-\alpha) \cdot \text{random} + \alpha \cdot \text{edge\_score}
+\text{score} = (1-\alpha) \cdot \text{random} + \alpha \cdot score_{\text{edge}}
 $$
 
 4. 升序排序 → 保留低分 patch（背景偏向）→ 掩盖高边缘强度 patch
@@ -521,7 +521,7 @@ $$
 3. Min-Max 归一化后与随机噪声凸组合：
 
 $$
-\text{score} = (1-\alpha) \cdot \text{random} + \alpha \cdot \text{attn\_score}
+\text{score} = (1-\alpha) \cdot \text{random} + \alpha \cdot score_{\text{attn}}
 $$
 
 4. 升序排序 → 保留低注意力 patch → 掩盖高显著性区域
