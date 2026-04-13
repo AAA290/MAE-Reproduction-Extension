@@ -1,22 +1,11 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-# --------------------------------------------------------
-# References:
-# DeiT: https://github.com/facebookresearch/deit
-# BEiT: https://github.com/microsoft/unilm/tree/master/beit
-# --------------------------------------------------------
-
+# 分割任务微调
 import argparse
+import os
 import datetime
 import json
 import numpy as np
-import os
 import time
 from pathlib import Path
-
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
@@ -30,25 +19,20 @@ sys.modules['torch._six'] = type('torch._six', (), {'container_abcs': collection
 # ========================================================
 
 import timm
-
 assert timm.__version__ == "0.3.2" # version check
-from timm.models.layers import trunc_normal_
-from timm.data.mixup import Mixup
-from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 
 import util.lr_decay as lrd
 import util.misc as misc
-from util.datasets import build_dataset
 from util.pos_embed import interpolate_pos_embed
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
+from my_util.datasets_seg import build_dataset
+from engine_segmentation import train_one_epoch, evaluate
 import my_vit
-
-from engine_finetune import train_one_epoch, evaluate
-
+from models_seg import ViTSegmentation
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('MAE fine-tuning for image classification', add_help=False)
+    parser = argparse.ArgumentParser('MAE fine-tuning for image segmentation', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--epochs', default=50, type=int)
@@ -87,34 +71,6 @@ def get_args_parser():
     # Augmentation parameters
     parser.add_argument('--color_jitter', type=float, default=None, metavar='PCT',
                         help='Color jitter factor (enabled only when not using Auto/RandAug)')
-    parser.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc1', metavar='NAME',
-                        help='Use AutoAugment policy. "v0" or "original". " + "(default: rand-m9-mstd0.5-inc1)'),
-    parser.add_argument('--smoothing', type=float, default=0.1,
-                        help='Label smoothing (default: 0.1)')
-
-    # * Random Erase params
-    parser.add_argument('--reprob', type=float, default=0.25, metavar='PCT',
-                        help='Random erase prob (default: 0.25)')
-    parser.add_argument('--remode', type=str, default='pixel',
-                        help='Random erase mode (default: "pixel")')
-    parser.add_argument('--recount', type=int, default=1,
-                        help='Random erase count (default: 1)')
-    parser.add_argument('--resplit', action='store_true', default=False,
-                        help='Do not random erase first (clean) augmentation split')
-
-    # * Mixup params
-    parser.add_argument('--mixup', type=float, default=0,
-                        help='mixup alpha, mixup enabled if > 0.')
-    parser.add_argument('--cutmix', type=float, default=0,
-                        help='cutmix alpha, cutmix enabled if > 0.')
-    parser.add_argument('--cutmix_minmax', type=float, nargs='+', default=None,
-                        help='cutmix min/max ratio, overrides alpha and enables cutmix if set (default: None)')
-    parser.add_argument('--mixup_prob', type=float, default=1.0,
-                        help='Probability of performing mixup or cutmix when either/both is enabled')
-    parser.add_argument('--mixup_switch_prob', type=float, default=0.5,
-                        help='Probability of switching to cutmix when both mixup and cutmix enabled')
-    parser.add_argument('--mixup_mode', type=str, default='batch',
-                        help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
 
     # * Finetuning params
     parser.add_argument('--finetune', default='',
@@ -125,11 +81,11 @@ def get_args_parser():
                         help='Use class token instead of global pool for classification')
 
     # Dataset parameters
-    parser.add_argument('--dataset', default='imagenet', type=str,
-                        help='dataset name (imagenet or pet)')
+    parser.add_argument('--dataset', default='pet_seg', type=str,
+                        help='dataset name')
     parser.add_argument('--data_path', default='/datasets01/imagenet_full_size/061417/', type=str,
                         help='dataset path')
-    parser.add_argument('--nb_classes', default=1000, type=int,
+    parser.add_argument('--nb_classes', default=3, type=int,
                         help='number of the classification types')
 
     parser.add_argument('--output_dir', default='./output_dir',
@@ -225,15 +181,6 @@ def main(args):
         drop_last=False
     )
 
-    mixup_fn = None
-    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
-    if mixup_active:
-        print("Mixup is activated!")
-        mixup_fn = Mixup(
-            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
-            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-            label_smoothing=args.smoothing, num_classes=args.nb_classes)
-    
     # model = models_vit.__dict__[args.model](
     #     num_classes=args.nb_classes,
     #     drop_path_rate=args.drop_path,
@@ -242,17 +189,13 @@ def main(args):
     # 将 args.global_pool (布尔值) 映射为 pool 字符串参数
     pool_type = 'mean' if args.global_pool else 'cls'
 
-    # 实例化MyViT
-    model = my_vit.MyVit(
-        img_size=224,
-        patch_size=16,
-        in_chans=3,
-        embed_dim=768,
-        depth=16,
-        num_heads=16,
-        pool=pool_type,
-        num_classes=args.nb_classes
+    # 实例化预训练的 Backbone
+    backbone = my_vit.MyVit(
+        img_size=224, patch_size=16, in_chans=3, embed_dim=768,
+        depth=16, num_heads=16, pool=pool_type, num_classes=args.nb_classes
     )
+    # 将 Backbone 塞进分割模型里，接上 Decoder
+    model = ViTSegmentation(backbone=backbone, embed_dim=768, num_classes=args.nb_classes)
 
     if args.finetune and not args.eval:
         checkpoint = torch.load(args.finetune, map_location='cpu', weights_only=False)
@@ -279,21 +222,11 @@ def main(args):
                 del checkpoint_model[k]
 
         # interpolate position embedding
-        interpolate_pos_embed(model, checkpoint_model)
+        interpolate_pos_embed(model.backbone, checkpoint_model)
 
         # load pre-trained model
         msg = model.load_state_dict(checkpoint_model, strict=False)
         print(msg)
-
-        # if args.global_pool:
-        #     assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
-        # else:
-        #     assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
-        # MyVit 的架构设计中只有 head 是新增的
-        assert set(msg.missing_keys) == {'head.weight', 'head.bias'}, f"Missing keys found: {msg.missing_keys}"
-
-        # manually initialize fc layer
-        trunc_normal_(model.head.weight, std=2e-5)
 
     model.to(device)
 
@@ -304,7 +237,7 @@ def main(args):
     print('number of params (M): %.2f' % (n_parameters / 1.e6))
 
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
-    
+
     if args.lr is None:  # only base_lr is specified
         args.lr = args.blr * eff_batch_size / 256
 
@@ -328,20 +261,17 @@ def main(args):
     skip_weight_decay_list = model_without_ddp.no_weight_decay() if hasattr(model_without_ddp, 'no_weight_decay') else {'pos_embed', 'cls_token'}
 
     # build optimizer with layer-wise lr decay (lrd)
-    param_groups = lrd.param_groups_lrd(model_without_ddp, args.weight_decay,
+    param_groups = lrd.param_groups_lrd(model_without_ddp.backbone, args.weight_decay,
                                         no_weight_decay_list=skip_weight_decay_list,
                                         layer_decay=args.layer_decay
                                         )
+    # 把 decoder（分割头）的参数也加进优化器，使用基础学习率（不衰减）
+    decoder_params = [p for n, p in model_without_ddp.named_parameters() if 'decoder' in n]
+    param_groups.append({'params': decoder_params, 'weight_decay': args.weight_decay})
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
     loss_scaler = NativeScaler()
 
-    if mixup_fn is not None:
-        # smoothing is handled with mixup label transform
-        criterion = SoftTargetCrossEntropy()
-    elif args.smoothing > 0.:
-        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-    else:
-        criterion = torch.nn.CrossEntropyLoss()
+    criterion = torch.nn.CrossEntropyLoss()
 
     print("criterion = %s" % str(criterion))
 
@@ -349,27 +279,23 @@ def main(args):
 
     if args.eval:
         test_stats = evaluate(data_loader_val, model, device)
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        print(f"mIoU of the network on the {len(dataset_val)} test images: {test_stats['miou']:.1f}%")
         exit(0)
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-    max_accuracy = 0.0
+    max_miou = 0.0
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
-            args.clip_grad, mixup_fn,
+            args.clip_grad,
             log_writer=log_writer,
             args=args
         )
-        # 每轮都存，硬盘爆炸
-        # if args.output_dir:
-        #     misc.save_model(
-        #         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-        #         loss_scaler=loss_scaler, epoch=epoch)
+
         # 只覆盖保存“最新”的一轮，防止断电丢失进度
         if args.output_dir:
             misc.save_model(
@@ -377,27 +303,26 @@ def main(args):
                 loss_scaler=loss_scaler, epoch="latest")
 
         test_stats = evaluate(data_loader_val, model, device)
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        print(f"mIoU of the network on the {len(dataset_val)} test images: {test_stats['miou']:.1f}%")
 
         # 如果当前轮次打破了历史最高分，额外存一个“最佳”模型
-        if test_stats["acc1"] > max_accuracy:
+        if test_stats["miou"] > max_miou:
             if args.output_dir:
                 misc.save_model(
                     args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                     loss_scaler=loss_scaler, epoch="best")
 
-        max_accuracy = max(max_accuracy, test_stats["acc1"])
-        print(f'Max accuracy: {max_accuracy:.2f}%')
+        max_miou = max(max_miou, test_stats["miou"])
+        print(f'Max mIoU: {max_miou:.2f}%')
 
         if log_writer is not None:
-            log_writer.add_scalar('perf/test_acc1', test_stats['acc1'], epoch)
-            log_writer.add_scalar('perf/test_acc5', test_stats['acc5'], epoch)
+            log_writer.add_scalar('perf/test_miou', test_stats['miou'], epoch)
             log_writer.add_scalar('perf/test_loss', test_stats['loss'], epoch)
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                        **{f'test_{k}': v for k, v in test_stats.items()},
-                        'epoch': epoch,
-                        'n_parameters': n_parameters}
+                     **{f'test_{k}': v for k, v in test_stats.items()},
+                     'epoch': epoch,
+                     'n_parameters': n_parameters}
 
         if args.output_dir and misc.is_main_process():
             if log_writer is not None:
